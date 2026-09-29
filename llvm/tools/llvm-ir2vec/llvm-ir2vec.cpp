@@ -54,7 +54,8 @@
 ///
 //===----------------------------------------------------------------------===//
 
-#include "lib/Utils.h"
+#include "IRUtils/IRUtils.h"
+#include "MIRUtils/MIRUtils.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Analysis/IR2Vec.h"
 #include "llvm/CodeGen/CommandFlags.h"
@@ -130,7 +131,7 @@ static cl::opt<std::string> OutputFilename("o", cl::desc("Output filename"),
 // Embedding-specific options
 static cl::opt<std::string>
     FunctionName("function", cl::desc("Process specific function only"),
-                 cl::value_desc("name"), cl::Optional, cl::init(""),
+                 cl::value_desc("name"), cl::init(""),
                  cl::sub(EmbeddingsSubCmd), cl::cat(CommonCategory));
 
 static cl::opt<EmbeddingLevel>
@@ -153,9 +154,19 @@ static Error processModule(Module &M, raw_ostream &OS) {
   if (EmbeddingsSubCmd) {
     // Initialize vocabulary for embedding generation
     // Note: Requires --ir2vec-vocab-path option to be set
-    auto VocabStatus = Tool.initializeVocabulary();
-    assert(VocabStatus && "Failed to initialize IR2Vec vocabulary");
-    (void)VocabStatus;
+    // and this value will be populated in the var VocabFile
+    if (VocabFile.empty()) {
+      return createStringError(
+          errc::invalid_argument,
+          "IR2Vec vocabulary file path not specified; "
+          "You may need to set it using --ir2vec-vocab-path");
+    }
+
+    std::shared_ptr<Vocabulary> Vocab;
+    if (auto Err = ir2vec::loadVocabulary(VocabFile).moveInto(Vocab))
+      return Err;
+    if (auto Err = Tool.setVocabulary(std::move(Vocab)))
+      return Err;
 
     if (!FunctionName.empty()) {
       // Process single function
@@ -197,13 +208,13 @@ static Error setupMIRContext(const std::string &InputFile, MIRContext &Ctx) {
     if (TheTriple.getTriple().empty())
       TheTriple.setTriple(sys::getDefaultTargetTriple());
 
-    auto TMOrErr = codegen::createTargetMachineForTriple(TheTriple.str());
+    auto TMOrErr = codegen::createTargetMachineForTriple(TheTriple);
     if (!TMOrErr) {
       Err.print(ToolName, errs());
       exit(1); // Match original behavior
     }
     Ctx.TM = std::move(*TMOrErr);
-    return Ctx.TM->createDataLayout().getStringRepresentation();
+    return TheTriple.computeDataLayout();
   };
 
   Ctx.M = MIR->parseIRModule(SetDataLayout);

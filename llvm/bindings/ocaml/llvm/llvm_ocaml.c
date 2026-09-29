@@ -238,11 +238,6 @@ value llvm_dispose_context(value C) {
   return Val_unit;
 }
 
-/* unit -> llcontext */
-value llvm_global_context(value Unit) {
-  return to_val(LLVMGetGlobalContext());
-}
-
 /* llcontext -> string -> int */
 value llvm_mdkind_id(value C, value Name) {
   unsigned MDKindID = LLVMGetMDKindIDInContext(Context_val(C), String_val(Name),
@@ -1139,18 +1134,6 @@ value llvm_aggregate_element(value Const, value N) {
 }
 
 /*--... Constant expressions ...............................................--*/
-
-/* lltype -> llvalue */
-value llvm_align_of(value Type) {
-  LLVMValueRef Value = LLVMAlignOf(Type_val(Type));
-  return to_val(Value);
-}
-
-/* lltype -> llvalue */
-value llvm_size_of(value Type) {
-  LLVMValueRef Value = LLVMSizeOf(Type_val(Type));
-  return to_val(Value);
-}
 
 /* llvalue -> llvalue */
 value llvm_const_neg(value Value) {

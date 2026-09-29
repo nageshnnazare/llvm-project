@@ -40,6 +40,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 using namespace PatternMatch;
@@ -140,8 +141,8 @@ static bool eliminateCondBranches_v1(Function &F) {
   // Eliminate branches with constant conditionals.
   for (BasicBlock &BB : F) {
     // Skip blocks without conditional branches as terminators.
-    BranchInst *BI = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!BI || !BI->isConditional())
+    CondBrInst *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+    if (!BI)
       continue;
 
     // Skip blocks with conditional branches without ConstantInt conditions.
@@ -158,7 +159,7 @@ static bool eliminateCondBranches_v1(Function &F) {
     // Replace the conditional branch with an unconditional one, by creating
     // a new unconditional branch to the selected successor and removing the
     // conditional one.
-    BranchInst::Create(BI->getSuccessor(CI->isZero()), BI->getIterator());
+    UncondBrInst::Create(BI->getSuccessor(CI->isZero()), BI->getIterator());
     BI->eraseFromParent();
     Changed = true;
   }
@@ -176,8 +177,8 @@ static bool eliminateCondBranches_v2(Function &F, DominatorTree &DT) {
   // Eliminate branches with constant conditionals.
   for (BasicBlock &BB : F) {
     // Skip blocks without conditional branches as terminators.
-    BranchInst *BI = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!BI || !BI->isConditional())
+    CondBrInst *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+    if (!BI)
       continue;
 
     // Skip blocks with conditional branches without ConstantInt conditions.
@@ -194,8 +195,8 @@ static bool eliminateCondBranches_v2(Function &F, DominatorTree &DT) {
     // Replace the conditional branch with an unconditional one, by creating
     // a new unconditional branch to the selected successor and removing the
     // conditional one.
-    BranchInst *NewBranch =
-        BranchInst::Create(BI->getSuccessor(CI->isZero()), BI->getIterator());
+    UncondBrInst *NewBranch =
+        UncondBrInst::Create(BI->getSuccessor(CI->isZero()), BI->getIterator());
     BI->eraseFromParent();
 
     // Delete the edge between BB and RemovedSucc in the DominatorTree, iff
@@ -242,8 +243,8 @@ static bool eliminateCondBranches_v3(Function &F, DominatorTree &DT) {
     // a new unconditional branch to the selected successor and removing the
     // conditional one.
 
-    BranchInst *NewBranch =
-        BranchInst::Create(TakenSucc, BB.getTerminator()->getIterator());
+    UncondBrInst *NewBranch =
+        UncondBrInst::Create(TakenSucc, BB.getTerminator()->getIterator());
     BB.getTerminator()->eraseFromParent();
 
     // Delete the edge between BB and RemovedSucc in the DominatorTree, iff
@@ -368,7 +369,7 @@ static bool doSimplify_v3(Function &F, DominatorTree &DT) {
 }
 
 namespace {
-struct SimplifyCFGPass : public PassInfoMixin<SimplifyCFGPass> {
+struct SimplifyCFGPass : public OptionalPassInfoMixin<SimplifyCFGPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     switch (Version) {
     case V1:
@@ -391,9 +392,15 @@ struct SimplifyCFGPass : public PassInfoMixin<SimplifyCFGPass> {
 };
 } // namespace
 
+static Error parseArguments(ArrayRef<const char *> Args) {
+  return parsePassPluginCommandLine("SimplifyCFG", Args);
+}
+
 /* New PM Registration */
 llvm::PassPluginLibraryInfo getExampleIRTransformsPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "SimplifyCFG", LLVM_VERSION_STRING,
+  return {LLVM_PLUGIN_API_VERSION,
+          "SimplifyCFG",
+          LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, llvm::FunctionPassManager &PM,
@@ -404,7 +411,9 @@ llvm::PassPluginLibraryInfo getExampleIRTransformsPluginInfo() {
                   }
                   return false;
                 });
-          }};
+          },
+          nullptr,
+          parseArguments};
 }
 
 #ifndef LLVM_EXAMPLEIRTRANSFORMS_LINK_INTO_TOOLS

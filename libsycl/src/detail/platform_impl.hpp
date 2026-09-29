@@ -5,6 +5,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+///
+/// \file
+/// This file contains the declaration of the PlatformImpl class, which
+/// implements sycl::platform functionality.
+///
+//===----------------------------------------------------------------------===//
 
 #ifndef _LIBSYCL_PLATFORM_IMPL
 #define _LIBSYCL_PLATFORM_IMPL
@@ -13,10 +19,12 @@
 #include <sycl/__impl/detail/config.hpp>
 #include <sycl/__impl/platform.hpp>
 
+#include <detail/device_impl.hpp>
 #include <detail/offload/offload_utils.hpp>
 
 #include <OffloadAPI.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -24,11 +32,22 @@
 
 _LIBSYCL_BEGIN_NAMESPACE_SYCL
 
+namespace unittests {
+struct UnittestsHelper;
+}
+
 namespace detail {
 
+class DeviceImpl;
+class ContextImpl;
+
 using PlatformImplUPtr = std::unique_ptr<PlatformImpl>;
+using DeviceImplUPtr = std::unique_ptr<DeviceImpl>;
 
 class PlatformImpl {
+  // Helper to limit PlatformImpl creation. It must be created in getPlatforms
+  // only. Using tag instead of private ctor + friend class to allow make_unique
+  // usage and to align with classes which impl is shared_ptr<>.
   struct PrivateTag {
     explicit PrivateTag() = default;
   };
@@ -37,15 +56,13 @@ public:
   /// Constructs PlatformImpl from a platform handle.
   ///
   /// \param Platform is a raw offload library handle representing platform.
-  /// \param PlatformIndex is a platform index in a backend (needed for a proper
-  /// indexing in device selector).
+  /// \param Devices are the devices in one platform context group.
   /// All platform impls are created during first getPlatforms() call.
-  PlatformImpl(ol_platform_handle_t Platform, size_t PlatformIndex, PrivateTag);
+  PlatformImpl(ol_platform_handle_t Platform,
+               const std::vector<ol_device_handle_t> &Devices, PrivateTag);
 
   ~PlatformImpl() = default;
 
-  /// Returns the backend associated with this platform.
-  ///
   /// \returns sycl::backend associated with this platform.
   backend getBackend() const noexcept { return MBackend; }
 
@@ -62,18 +79,20 @@ public:
   /// within its lifetime.
   ///
   /// \return a raw offload platform handle.
-  const ol_platform_handle_t &getHandleRef() const { return MOffloadPlatform; }
+  const ol_platform_handle_t &getOLHandleRef() const {
+    return MOffloadPlatform;
+  }
 
-  /// Queries the cache to get the implementation for specified offloading RT
-  /// platform. All platform implementation objects are created at first
-  /// get_platforms call.
+  /// Indicates if all of the SYCL devices on this platform have the
+  /// given aspect.
   ///
-  /// \param Platform is the offloading RT Platform handle representing the
-  /// platform.
-  /// \return the PlatformImpl representing the offloading RT platform.
-  static PlatformImpl &getPlatformImpl(ol_platform_handle_t Platform);
+  /// \param Aspect is one of the values defined in SYCL 2020 Section 4.6.4.5.
+  ///
+  /// \return true all of the SYCL devices on this platform have the
+  /// given aspect.
+  bool has(aspect Aspect) const;
 
-  /// Queries this platform for info.
+  /// Queries this SYCL platform for info.
   ///
   /// The return type depends on information being queried.
   template <typename Param> typename Param::return_type getInfo() const {
@@ -99,11 +118,32 @@ public:
     return Result;
   }
 
+  /// Calls "callback" with every root device of type == DeviceType associated
+  /// with this platform
+  void iterateDevices(info::device_type DeviceType,
+                      std::function<void(DeviceImpl *)> callback) const;
+
+  /// \return the default context containing all devices in this platform.
+  ContextImpl &getDefaultContext();
+
 private:
-  ol_platform_handle_t MOffloadPlatform{};
-  size_t MOffloadPlatformIndex{};
-  ol_platform_backend_t MOffloadBackend{OL_PLATFORM_BACKEND_UNKNOWN};
+  /// \return reference to collection of root devices for platform
+  const std::vector<DeviceImplUPtr> &getRootDevices() const;
+
+  const ol_platform_handle_t MOffloadPlatform{};
+
   backend MBackend{};
+
+  std::vector<DeviceImplUPtr> MRootDevices;
+
+  std::shared_ptr<ContextImpl> MDefaultContext;
+
+  // Single initialization of platforms and devices doesn't allow to implement
+  // unittests for this behavior. This flag and friend class allows to force
+  // device & platform rediscovery at the next getPlatforms() call if the cache
+  // is empty.
+  static bool rediscoverIfEmpty;
+  friend struct ::sycl::unittests::UnittestsHelper;
 };
 
 } // namespace detail

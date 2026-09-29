@@ -80,6 +80,7 @@
 #include "llvm/IR/IntrinsicsWebAssembly.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassTimingInfo.h"
 #include "llvm/IR/PrintPasses.h"
 #include "llvm/IR/Statepoint.h"
 #include "llvm/IR/Type.h"
@@ -383,12 +384,6 @@ bool SelectionDAGISelLegacy::runOnMachineFunction(MachineFunction &MF) {
   // we change the optimisation level.
   MF.setUseDebugInstrRef(MF.shouldUseDebugInstrRef());
 
-  // Reset the target options before resetting the optimization
-  // level below.
-  // FIXME: This is a horrible hack and should be processed via
-  // codegen looking at the optimization level explicitly when
-  // it wants to look at it.
-  Selector->TM.resetTargetOptions(MF.getFunction());
   // Reset OptLevel to None for optnone functions.
   CodeGenOptLevel NewOptLevel = skipFunction(MF.getFunction())
                                     ? CodeGenOptLevel::None
@@ -456,19 +451,14 @@ SelectionDAGISelPass::run(MachineFunction &MF,
   // we change the optimisation level.
   MF.setUseDebugInstrRef(MF.shouldUseDebugInstrRef());
 
-  // Reset the target options before resetting the optimization
-  // level below.
-  // FIXME: This is a horrible hack and should be processed via
-  // codegen looking at the optimization level explicitly when
-  // it wants to look at it.
-  Selector->TM.resetTargetOptions(MF.getFunction());
-  // Reset OptLevel to None for optnone functions.
+  // Reset OptLevel to None for optnone functions or when opt-bisect skips.
   // TODO: Add a function analysis to handle this.
   Selector->MF = &MF;
-  // Reset OptLevel to None for optnone functions.
-  CodeGenOptLevel NewOptLevel = MF.getFunction().hasOptNone()
-                                    ? CodeGenOptLevel::None
-                                    : Selector->OptLevel;
+  CodeGenOptLevel NewOptLevel =
+      (MF.getFunction().hasOptNone() ||
+       shouldSkipOptimizationForOptBisect(MF.getFunction()))
+          ? CodeGenOptLevel::None
+          : Selector->OptLevel;
 
   OptLevelChanger OLC(*Selector, NewOptLevel);
   Selector->initializeAnalysisResults(MFAM);
@@ -502,7 +492,6 @@ void SelectionDAGISel::initializeAnalysisResults(
   AC = &FAM.getResult<AssumptionAnalysis>(Fn);
   auto *PSI = MAMP.getCachedResult<ProfileSummaryAnalysis>(*Fn.getParent());
   BlockFrequencyInfo *BFI = nullptr;
-  FAM.getResult<BlockFrequencyAnalysis>(Fn);
   if (PSI && PSI->hasProfileSummary() && RegisterPGOPasses)
     BFI = &FAM.getResult<BlockFrequencyAnalysis>(Fn);
 
@@ -511,19 +500,16 @@ void SelectionDAGISel::initializeAnalysisResults(
     FnVarLocs = &FAM.getResult<DebugAssignmentTrackingAnalysis>(Fn);
 
   auto *UA = FAM.getCachedResult<UniformityInfoAnalysis>(Fn);
-  MachineModuleInfo &MMI =
-      MAMP.getCachedResult<MachineModuleAnalysis>(*Fn.getParent())->getMMI();
 
-  const LibcallLoweringModuleAnalysisResult *LibcallResult =
+  const ModuleLibcallLoweringInfo *LibcallResult =
       MAMP.getCachedResult<LibcallLoweringModuleAnalysis>(*Fn.getParent());
   if (!LibcallResult) {
     reportFatalUsageError("'" + LibcallLoweringModuleAnalysis::name() +
                           "' analysis required");
   }
 
-  LibcallLowering = &LibcallResult->getLibcallLowering(Subtarget);
-  CurDAG->init(*MF, *ORE, MFAM, LibInfo, LibcallLowering, UA, PSI, BFI, MMI,
-               FnVarLocs);
+  LibcallLowering = &getLibcallLowering(*LibcallResult, Subtarget);
+  CurDAG->init(*MF, MFAM, LibInfo, LibcallLowering, UA, PSI, BFI, FnVarLocs);
 
   // Now get the optional analyzes if we want to.
   // This is based on the possibly changed OptLevel (after optnone is taken
@@ -581,15 +567,11 @@ void SelectionDAGISel::initializeAnalysisResults(MachineFunctionPass &MFP) {
   if (auto *UAPass = MFP.getAnalysisIfAvailable<UniformityInfoWrapperPass>())
     UA = &UAPass->getUniformityInfo();
 
-  MachineModuleInfo &MMI =
-      MFP.getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
-
   LibcallLowering =
       &MFP.getAnalysis<LibcallLoweringInfoWrapper>().getLibcallLowering(
           *Fn.getParent(), Subtarget);
 
-  CurDAG->init(*MF, *ORE, &MFP, LibInfo, LibcallLowering, UA, PSI, BFI, MMI,
-               FnVarLocs);
+  CurDAG->init(*MF, LibInfo, LibcallLowering, UA, PSI, BFI, FnVarLocs);
 
   // Now get the optional analyzes if we want to.
   // This is based on the possibly changed OptLevel (after optnone is taken
@@ -668,15 +650,14 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
   // registers. If we don't apply the reg fixups before, some registers may
   // appear as unused and will be skipped, resulting in bad MI.
   MachineRegisterInfo &MRI = MF->getRegInfo();
-  for (DenseMap<Register, Register>::iterator I = FuncInfo->RegFixups.begin(),
-                                              E = FuncInfo->RegFixups.end();
+  for (auto I = FuncInfo->RegFixups.begin(), E = FuncInfo->RegFixups.end();
        I != E; ++I) {
     Register From = I->first;
     Register To = I->second;
     // If To is also scheduled to be replaced, find what its ultimate
     // replacement is.
     while (true) {
-      DenseMap<Register, Register>::iterator J = FuncInfo->RegFixups.find(To);
+      auto J = FuncInfo->RegFixups.find(To);
       if (J == E)
         break;
       To = J->second;
@@ -751,7 +732,7 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
     // If Reg is live-in then update debug info to track its copy in a vreg.
     if (!Reg.isPhysical())
       continue;
-    DenseMap<MCRegister, Register>::iterator LDI = LiveInMap.find(Reg);
+    auto LDI = LiveInMap.find(Reg);
     if (LDI != LiveInMap.end()) {
       assert(!hasFI && "There's no handling of frame pointer updating here yet "
                        "- add if needed");
@@ -1468,7 +1449,8 @@ bool SelectionDAGISel::PrepareEHLandingPad() {
       if (hasExceptionPointerOrCodeUser(CPI)) {
         // Get or create the virtual register to hold the pointer or code.  Mark
         // the live in physreg and copy into the vreg.
-        MCRegister EHPhysReg = TLI->getExceptionPointerRegister(PersonalityFn);
+        MCRegister EHPhysReg = TLI->getExceptionPointerRegister(
+            FuncInfo->ExceptionModel, PersonalityFn);
         assert(EHPhysReg && "target lacks exception pointer register");
         MBB->addLiveIn(EHPhysReg);
         Register VReg = FuncInfo->getCatchPadExceptionPointerVReg(CPI, PtrRC);
@@ -1501,10 +1483,12 @@ bool SelectionDAGISel::PrepareEHLandingPad() {
     // Assign the call site to the landing pad's begin label.
     MF->setCallSiteLandingPad(Label, SDB->LPadToCallSiteMap[MBB]);
     // Mark exception register as live in.
-    if (MCRegister Reg = TLI->getExceptionPointerRegister(PersonalityFn))
+    if (MCRegister Reg = TLI->getExceptionPointerRegister(
+            FuncInfo->ExceptionModel, PersonalityFn))
       FuncInfo->ExceptionPointerVirtReg = MBB->addLiveIn(Reg, PtrRC);
     // Mark exception selector register as live in.
-    if (MCRegister Reg = TLI->getExceptionSelectorRegister(PersonalityFn))
+    if (MCRegister Reg = TLI->getExceptionSelectorRegister(
+            FuncInfo->ExceptionModel, PersonalityFn))
       FuncInfo->ExceptionSelectorVirtReg = MBB->addLiveIn(Reg, PtrRC);
   }
 
@@ -2729,7 +2713,7 @@ void SelectionDAGISel::Select_PATCHPOINT(SDNode *N) {
 
 /// GetVBR - decode a vbr encoding whose top bit is set.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static uint64_t
-GetVBR(uint64_t Val, const uint8_t *MatcherTable, unsigned &Idx) {
+GetVBR(uint64_t Val, const uint8_t *MatcherTable, size_t &Idx) {
   assert(Val >= 128 && "Not a VBR");
   Val &= 127;  // Remove first vbr bit.
 
@@ -2745,7 +2729,7 @@ GetVBR(uint64_t Val, const uint8_t *MatcherTable, unsigned &Idx) {
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static int64_t
-GetSignedVBR(const unsigned char *MatcherTable, unsigned &Idx) {
+GetSignedVBR(const unsigned char *MatcherTable, size_t &Idx) {
   int64_t Val = 0;
   unsigned Shift = 0;
   uint64_t NextBits;
@@ -2764,7 +2748,7 @@ GetSignedVBR(const unsigned char *MatcherTable, unsigned &Idx) {
 /// getSimpleVT - Decode a value in MatcherTable, if it's a VBR encoded value,
 /// use GetVBR to decode it.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static MVT::SimpleValueType
-getSimpleVT(const uint8_t *MatcherTable, unsigned &MatcherIndex) {
+getSimpleVT(const uint8_t *MatcherTable, size_t &MatcherIndex) {
   unsigned SimpleVT = MatcherTable[MatcherIndex++];
   if (SimpleVT & 128)
     SimpleVT = GetVBR(SimpleVT, MatcherTable, MatcherIndex);
@@ -2774,7 +2758,7 @@ getSimpleVT(const uint8_t *MatcherTable, unsigned &MatcherIndex) {
 
 /// Decode a HwMode VT in MatcherTable by calling getValueTypeForHwMode.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static MVT
-getHwModeVT(const uint8_t *MatcherTable, unsigned &MatcherIndex,
+getHwModeVT(const uint8_t *MatcherTable, size_t &MatcherIndex,
             const SelectionDAGISel &SDISel) {
   unsigned Index = MatcherTable[MatcherIndex++];
   return SDISel.getValueTypeForHwMode(Index);
@@ -2976,7 +2960,7 @@ MorphNode(SDNode *Node, unsigned TargetOpc, SDVTList VTList,
 
 /// CheckSame - Implements OP_CheckSame.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckSame(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
+CheckSame(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N,
           const SmallVectorImpl<std::pair<SDValue, SDNode *>> &RecordedNodes) {
   // Accept if it is exactly the same as a previously recorded node.
   unsigned RecNo = MatcherTable[MatcherIndex++];
@@ -2986,7 +2970,7 @@ CheckSame(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
 
 /// CheckChildSame - Implements OP_CheckChildXSame.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool CheckChildSame(
-    const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
+    const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N,
     const SmallVectorImpl<std::pair<SDValue, SDNode *>> &RecordedNodes,
     unsigned ChildNo) {
   if (ChildNo >= N.getNumOperands())
@@ -2998,7 +2982,7 @@ LLVM_ATTRIBUTE_ALWAYS_INLINE static bool CheckChildSame(
 /// CheckPatternPredicate - Implements OP_CheckPatternPredicate.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
 CheckPatternPredicate(unsigned Opcode, const uint8_t *MatcherTable,
-                      unsigned &MatcherIndex, const SelectionDAGISel &SDISel) {
+                      size_t &MatcherIndex, const SelectionDAGISel &SDISel) {
   bool TwoBytePredNo =
       Opcode == SelectionDAGISel::OPC_CheckPatternPredicateTwoByte;
   unsigned PredNo =
@@ -3013,7 +2997,7 @@ CheckPatternPredicate(unsigned Opcode, const uint8_t *MatcherTable,
 /// CheckNodePredicate - Implements OP_CheckNodePredicate.
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
 CheckNodePredicate(unsigned Opcode, const uint8_t *MatcherTable,
-                   unsigned &MatcherIndex, const SelectionDAGISel &SDISel,
+                   size_t &MatcherIndex, const SelectionDAGISel &SDISel,
                    SDValue Op) {
   unsigned PredNo = Opcode == SelectionDAGISel::OPC_CheckPredicate
                         ? MatcherTable[MatcherIndex++]
@@ -3022,7 +3006,7 @@ CheckNodePredicate(unsigned Opcode, const uint8_t *MatcherTable,
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckOpcode(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDNode *N) {
+CheckOpcode(const uint8_t *MatcherTable, size_t &MatcherIndex, SDNode *N) {
   uint16_t Opc = MatcherTable[MatcherIndex++];
   Opc |= static_cast<uint16_t>(MatcherTable[MatcherIndex++]) << 8;
   return N->getOpcode() == Opc;
@@ -3048,13 +3032,13 @@ CheckChildType(MVT::SimpleValueType VT, SDValue N, const TargetLowering *TLI,
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckCondCode(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N) {
+CheckCondCode(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N) {
   return cast<CondCodeSDNode>(N)->get() ==
          static_cast<ISD::CondCode>(MatcherTable[MatcherIndex++]);
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckChild2CondCode(const uint8_t *MatcherTable, unsigned &MatcherIndex,
+CheckChild2CondCode(const uint8_t *MatcherTable, size_t &MatcherIndex,
                     SDValue N) {
   if (2 >= N.getNumOperands())
     return false;
@@ -3062,7 +3046,7 @@ CheckChild2CondCode(const uint8_t *MatcherTable, unsigned &MatcherIndex,
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckValueType(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
+CheckValueType(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N,
                const TargetLowering *TLI, const DataLayout &DL) {
   MVT::SimpleValueType VT = getSimpleVT(MatcherTable, MatcherIndex);
   if (cast<VTSDNode>(N)->getVT() == VT)
@@ -3073,7 +3057,7 @@ CheckValueType(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckInteger(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N) {
+CheckInteger(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N) {
   int64_t Val = GetSignedVBR(MatcherTable, MatcherIndex);
 
   ConstantSDNode *C = dyn_cast<ConstantSDNode>(N);
@@ -3081,15 +3065,15 @@ CheckInteger(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N) {
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckChildInteger(const uint8_t *MatcherTable, unsigned &MatcherIndex,
-                  SDValue N, unsigned ChildNo) {
+CheckChildInteger(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N,
+                  unsigned ChildNo) {
   if (ChildNo >= N.getNumOperands())
     return false;  // Match fails if out of range child #.
   return ::CheckInteger(MatcherTable, MatcherIndex, N.getOperand(ChildNo));
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckAndImm(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
+CheckAndImm(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N,
             const SelectionDAGISel &SDISel) {
   int64_t Val = MatcherTable[MatcherIndex++];
   if (Val & 128)
@@ -3102,7 +3086,7 @@ CheckAndImm(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static bool
-CheckOrImm(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
+CheckOrImm(const uint8_t *MatcherTable, size_t &MatcherIndex, SDValue N,
            const SelectionDAGISel &SDISel) {
   int64_t Val = MatcherTable[MatcherIndex++];
   if (Val & 128)
@@ -3120,8 +3104,8 @@ CheckOrImm(const uint8_t *MatcherTable, unsigned &MatcherIndex, SDValue N,
 /// known to pass, set Result=false and return the MatcherIndex to continue
 /// with.  If the current predicate is unknown, set Result=false and return the
 /// MatcherIndex to continue with.
-static unsigned IsPredicateKnownToFail(
-    const uint8_t *Table, unsigned Index, SDValue N, bool &Result,
+static size_t IsPredicateKnownToFail(
+    const uint8_t *Table, size_t Index, SDValue N, bool &Result,
     const SelectionDAGISel &SDISel,
     SmallVectorImpl<std::pair<SDValue, SDNode *>> &RecordedNodes) {
   unsigned Opcode = Table[Index++];
@@ -3168,7 +3152,8 @@ static unsigned IsPredicateKnownToFail(
   case SelectionDAGISel::OPC_CheckType:
   case SelectionDAGISel::OPC_CheckTypeI32:
   case SelectionDAGISel::OPC_CheckTypeI64:
-  case SelectionDAGISel::OPC_CheckTypeByHwMode: {
+  case SelectionDAGISel::OPC_CheckTypeByHwMode:
+  case SelectionDAGISel::OPC_CheckTypeByHwMode0: {
     MVT VT;
     switch (Opcode) {
     case SelectionDAGISel::OPC_CheckTypeI32:
@@ -3179,6 +3164,9 @@ static unsigned IsPredicateKnownToFail(
       break;
     case SelectionDAGISel::OPC_CheckTypeByHwMode:
       VT = getHwModeVT(Table, Index, SDISel);
+      break;
+    case SelectionDAGISel::OPC_CheckTypeByHwMode0:
+      VT = SDISel.getValueTypeForHwMode(0);
       break;
     default:
       VT = getSimpleVT(Table, Index);
@@ -3229,7 +3217,15 @@ static unsigned IsPredicateKnownToFail(
   case SelectionDAGISel::OPC_CheckChild4TypeByHwMode:
   case SelectionDAGISel::OPC_CheckChild5TypeByHwMode:
   case SelectionDAGISel::OPC_CheckChild6TypeByHwMode:
-  case SelectionDAGISel::OPC_CheckChild7TypeByHwMode: {
+  case SelectionDAGISel::OPC_CheckChild7TypeByHwMode:
+  case SelectionDAGISel::OPC_CheckChild0TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild1TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild2TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild3TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild4TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild5TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild6TypeByHwMode0:
+  case SelectionDAGISel::OPC_CheckChild7TypeByHwMode0: {
     MVT VT;
     unsigned ChildNo;
     if (Opcode >= SelectionDAGISel::OPC_CheckChild0TypeI32 &&
@@ -3244,6 +3240,10 @@ static unsigned IsPredicateKnownToFail(
                Opcode <= SelectionDAGISel::OPC_CheckChild7TypeByHwMode) {
       VT = getHwModeVT(Table, Index, SDISel);
       ChildNo = Opcode - SelectionDAGISel::OPC_CheckChild0TypeByHwMode;
+    } else if (Opcode >= SelectionDAGISel::OPC_CheckChild0TypeByHwMode0 &&
+               Opcode <= SelectionDAGISel::OPC_CheckChild7TypeByHwMode0) {
+      VT = SDISel.getValueTypeForHwMode(0);
+      ChildNo = Opcode - SelectionDAGISel::OPC_CheckChild0TypeByHwMode0;
     } else {
       VT = getSimpleVT(Table, Index);
       ChildNo = Opcode - SelectionDAGISel::OPC_CheckChild0Type;
@@ -3350,7 +3350,8 @@ public:
 
 void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
                                         const uint8_t *MatcherTable,
-                                        unsigned TableSize) {
+                                        unsigned TableSize,
+                                        const uint8_t *OperandLists) {
   // FIXME: Should these even be selected?  Handle these cases in the caller?
   switch (NodeToMatch->getOpcode()) {
   default:
@@ -3475,7 +3476,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
   // but if the state machine starts with an OPC_SwitchOpcode, then we
   // accelerate the first lookup (which is guaranteed to be hot) with the
   // OpcodeOffset table.
-  unsigned MatcherIndex = 0;
+  size_t MatcherIndex = 0;
 
   if (!OpcodeOffset.empty()) {
     // Already computed the OpcodeOffset table, just index into it.
@@ -3487,7 +3488,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     // Otherwise, the table isn't computed, but the state machine does start
     // with an OPC_SwitchOpcode instruction.  Populate the table now, since this
     // is the first time we're selecting an instruction.
-    unsigned Idx = 1;
+    size_t Idx = 1;
     while (true) {
       // Get the size of this case.
       unsigned CaseSize = MatcherTable[Idx++];
@@ -3512,7 +3513,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
   while (true) {
     assert(MatcherIndex < TableSize && "Invalid index");
 #ifndef NDEBUG
-    unsigned CurrentOpcodeIndex = MatcherIndex;
+    size_t CurrentOpcodeIndex = MatcherIndex;
 #endif
     BuiltinOpcodes Opcode =
         static_cast<BuiltinOpcodes>(MatcherTable[MatcherIndex++]);
@@ -3523,7 +3524,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
       // the first check fail (which then pops it) is inefficient.  If we can
       // determine immediately that the first check (or first several) will
       // immediately fail, don't even bother pushing a scope for them.
-      unsigned FailIndex;
+      size_t FailIndex;
 
       while (true) {
         unsigned NumToSkip = MatcherTable[MatcherIndex++];
@@ -3537,7 +3538,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
 
         FailIndex = MatcherIndex+NumToSkip;
 
-        unsigned MatcherIndexOfPredicate = MatcherIndex;
+        size_t MatcherIndexOfPredicate = MatcherIndex;
         (void)MatcherIndexOfPredicate; // silence warning.
 
         // If we can't evaluate this predicate without pushing a scope (e.g. if
@@ -3565,7 +3566,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
 
       // Push a MatchScope which indicates where to go if the first child fails
       // to match.
-      MatchScope NewEntry;
+      MatchScope &NewEntry = MatchScopes.emplace_back();
       NewEntry.FailIndex = FailIndex;
       NewEntry.NodeStack.append(NodeStack.begin(), NodeStack.end());
       NewEntry.NumRecordedNodes = RecordedNodes.size();
@@ -3573,7 +3574,6 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
       NewEntry.InputChain = InputChain;
       NewEntry.InputGlue = InputGlue;
       NewEntry.HasChainNodesMatched = !ChainNodesMatched.empty();
-      MatchScopes.push_back(NewEntry);
       continue;
     }
     case OPC_RecordNode: {
@@ -3598,7 +3598,7 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     }
     case OPC_RecordMemRef:
       if (auto *MN = dyn_cast<MemSDNode>(N))
-        MatchedMemRefs.push_back(MN->getMemOperand());
+        llvm::append_range(MatchedMemRefs, MN->memoperands());
       else {
         LLVM_DEBUG(dbgs() << "Expected MemSDNode "; N->dump(CurDAG);
                    dbgs() << '\n');
@@ -3756,7 +3756,8 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     case OPC_CheckType:
     case OPC_CheckTypeI32:
     case OPC_CheckTypeI64:
-    case OPC_CheckTypeByHwMode: {
+    case OPC_CheckTypeByHwMode:
+    case OPC_CheckTypeByHwMode0: {
       MVT VT;
       switch (Opcode) {
       case OPC_CheckTypeI32:
@@ -3767,6 +3768,9 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
         break;
       case OPC_CheckTypeByHwMode:
         VT = getHwModeVT(MatcherTable, MatcherIndex, *this);
+        break;
+      case OPC_CheckTypeByHwMode0:
+        VT = getValueTypeForHwMode(0);
         break;
       default:
         VT = getSimpleVT(MatcherTable, MatcherIndex);
@@ -3901,9 +3905,25 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     case OPC_CheckChild4TypeByHwMode:
     case OPC_CheckChild5TypeByHwMode:
     case OPC_CheckChild6TypeByHwMode:
-    case OPC_CheckChild7TypeByHwMode: {
-      MVT VT = getHwModeVT(MatcherTable, MatcherIndex, *this);
-      unsigned ChildNo = Opcode - OPC_CheckChild0TypeByHwMode;
+    case OPC_CheckChild7TypeByHwMode:
+    case OPC_CheckChild0TypeByHwMode0:
+    case OPC_CheckChild1TypeByHwMode0:
+    case OPC_CheckChild2TypeByHwMode0:
+    case OPC_CheckChild3TypeByHwMode0:
+    case OPC_CheckChild4TypeByHwMode0:
+    case OPC_CheckChild5TypeByHwMode0:
+    case OPC_CheckChild6TypeByHwMode0:
+    case OPC_CheckChild7TypeByHwMode0: {
+      MVT VT;
+      unsigned ChildNo;
+      if (Opcode >= OPC_CheckChild0TypeByHwMode0 &&
+          Opcode <= OPC_CheckChild7TypeByHwMode0) {
+        VT = getValueTypeForHwMode(0);
+        ChildNo = Opcode - OPC_CheckChild0TypeByHwMode0;
+      } else {
+        VT = getHwModeVT(MatcherTable, MatcherIndex, *this);
+        ChildNo = Opcode - OPC_CheckChild0TypeByHwMode;
+      }
       if (!::CheckChildType(VT.SimpleTy, N, TLI, CurDAG->getDataLayout(),
                             ChildNo))
         break;
@@ -3943,6 +3963,10 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
       if (!ISD::isConstantSplatVectorAllZeros(N.getNode()))
         break;
       continue;
+    case OPC_CheckUndef:
+      if (!N.isUndef())
+        break;
+      continue;
 
     case OPC_CheckFoldableChainNode: {
       assert(NodeStack.size() != 1 && "No parent node");
@@ -3978,7 +4002,8 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     case OPC_EmitIntegerI16:
     case OPC_EmitIntegerI32:
     case OPC_EmitIntegerI64:
-    case OPC_EmitIntegerByHwMode: {
+    case OPC_EmitIntegerByHwMode:
+    case OPC_EmitIntegerByHwMode0: {
       MVT VT;
       switch (Opcode) {
       case OPC_EmitIntegerI8:
@@ -3995,6 +4020,9 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
         break;
       case OPC_EmitIntegerByHwMode:
         VT = getHwModeVT(MatcherTable, MatcherIndex, *this);
+        break;
+      case OPC_EmitIntegerByHwMode0:
+        VT = getValueTypeForHwMode(0);
         break;
       default:
         VT = getSimpleVT(MatcherTable, MatcherIndex);
@@ -4227,8 +4255,8 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     case OPC_MorphNodeTo2GlueInput:
     case OPC_MorphNodeTo1GlueOutput:
     case OPC_MorphNodeTo2GlueOutput: {
-      uint16_t TargetOpc = MatcherTable[MatcherIndex++];
-      TargetOpc |= static_cast<uint16_t>(MatcherTable[MatcherIndex++]) << 8;
+      uint32_t TargetOpc = MatcherTable[MatcherIndex++];
+      TargetOpc |= (MatcherTable[MatcherIndex++] << 8);
       unsigned EmitNodeInfo;
       if (Opcode >= OPC_EmitNode1None && Opcode <= OPC_EmitNode2Chain) {
         if (Opcode >= OPC_EmitNode0Chain && Opcode <= OPC_EmitNode2Chain)
@@ -4308,14 +4336,22 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
 
       // Get the operand list.
       unsigned NumOps = MatcherTable[MatcherIndex++];
-      SmallVector<SDValue, 8> Ops;
-      for (unsigned i = 0; i != NumOps; ++i) {
-        unsigned RecNo = MatcherTable[MatcherIndex++];
-        if (RecNo & 128)
-          RecNo = GetVBR(RecNo, MatcherTable, MatcherIndex);
 
-        assert(RecNo < RecordedNodes.size() && "Invalid EmitNode");
-        Ops.push_back(RecordedNodes[RecNo].first);
+      SmallVector<SDValue, 8> Ops;
+      if (NumOps != 0) {
+        // Get the index into the OperandLists.
+        size_t OperandIndex = MatcherTable[MatcherIndex++];
+        if (OperandIndex & 128)
+          OperandIndex = GetVBR(OperandIndex, MatcherTable, MatcherIndex);
+
+        for (unsigned i = 0; i != NumOps; ++i) {
+          unsigned RecNo = OperandLists[OperandIndex++];
+          if (RecNo & 128)
+            RecNo = GetVBR(RecNo, OperandLists, OperandIndex);
+
+          assert(RecNo < RecordedNodes.size() && "Invalid EmitNode");
+          Ops.push_back(RecordedNodes[RecNo].first);
+        }
       }
 
       // If there are variadic operands to add, handle them now.
