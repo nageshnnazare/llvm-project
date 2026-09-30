@@ -247,6 +247,9 @@ features cannot lower the translation-unit ABI level;
 
 - Added support for the `__builtin_strlcat` and `__builtin_strlcpy` builtins.
 
+- Added `__builtin_sort_pack` to sort a pack of types using the same
+  order as `__builtin_type_order`.
+
 ### New Compiler Flags
 
 - New option `-fdefined-pointer-subtraction` added to preserve stable semantics
@@ -815,6 +818,7 @@ features cannot lower the translation-unit ABI level;
 - Fixed an assertion failure when a method or function definition follows an
   Objective-C `@implementation` that was ended by a nested `@interface`,
   `@protocol` or `@implementation` before its `@end`. (#GH209503)
+- Fixed use-after-free with annotate attribute on a C++ class method with a this-adjusting thunk.
 
 ### OpenACC Specific Changes
 
@@ -925,6 +929,10 @@ features cannot lower the translation-unit ABI level;
 
 - Added `__builtin_wasm_memory_copy` and `__builtin_wasm_memory_fill` builtins
   for the WebAssembly `memory.copy` and `memory.fill` bulk memory instructions.
+
+- Fixed a "function signature mismatch" trap at program exit when destroying a
+  temporary that is bound to a reference with static or thread storage
+  duration. (#GH45221)
 
 #### AVR Support
 
