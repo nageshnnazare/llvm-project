@@ -23,6 +23,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -791,9 +792,6 @@ public:
   ArrayRef<const Init *> getElements() const {
     return ArrayRef(getTrailingObjects(), NumElements);
   }
-
-  LLVM_DEPRECATED_WITH_FIXIT("Use getElements instead", "getElements")
-  ArrayRef<const Init *> getValues() const { return getElements(); }
 
   const Init *getElement(unsigned Idx) const { return getElements()[Idx]; }
 
@@ -1645,7 +1643,8 @@ public:
   /// Get the type of the field for printing purposes.
   std::string getPrintType() const;
 
-  /// Get the value of the field as an Init.
+  /// Get the value of the field as an Init. This is never null: a field that
+  /// has not been given a value has an UnsetInit.
   const Init *getValue() const { return Value; }
 
   /// Set the value of the field from an Init.
@@ -1706,7 +1705,9 @@ private:
   SmallVector<SMLoc, 0> ForwardDeclarationLocs;
   mutable SmallVector<SMRange, 0> ReferenceLocs;
   mutable DenseMap<const Init *, SmallVector<SMRange, 0>> ValueReferenceLocs;
-  SmallVector<const Init *, 0> TemplateArgs;
+  // Template arguments, in order.
+  SmallVector<RecordVal, 0> TemplateArgs;
+  // Fields, including the ones inherited from superclasses.
   SmallVector<RecordVal, 0> Values;
   SmallVector<AssertionInfo, 0> Assertions;
   SmallVector<DumpInfo, 0> Dumps;
@@ -1747,7 +1748,8 @@ public:
   Record(const Record &O)
       : Name(O.Name), Locs(O.Locs), ValueReferenceLocs(O.ValueReferenceLocs),
         TemplateArgs(O.TemplateArgs), Values(O.Values),
-        Assertions(O.Assertions), DirectSuperClasses(O.DirectSuperClasses),
+        Assertions(O.Assertions), Dumps(O.Dumps),
+        DirectSuperClasses(O.DirectSuperClasses),
         TrackedRecords(O.TrackedRecords), ID(getNewUID(O.getRecords())),
         Kind(O.Kind) {}
 
@@ -1813,8 +1815,10 @@ public:
 
   bool isAnonymous() const { return Kind == RK_AnonymousDef; }
 
-  ArrayRef<const Init *> getTemplateArgs() const { return TemplateArgs; }
+  /// Return the template arguments of this class or multiclass.
+  ArrayRef<RecordVal> getTemplateArgs() const { return TemplateArgs; }
 
+  /// Return the fields of this record.
   ArrayRef<RecordVal> getValues() const { return Values; }
 
   ArrayRef<AssertionInfo> getAssertions() const { return Assertions; }
@@ -1845,10 +1849,22 @@ public:
     return DirectSuperClasses;
   }
 
-  bool isTemplateArg(const Init *Name) const {
-    return llvm::is_contained(TemplateArgs, Name);
+  /// Return the template argument with the given name, or null if there is
+  /// none.
+  const RecordVal *getTemplateArg(const Init *Name) const {
+    for (const RecordVal &Arg : TemplateArgs)
+      if (Arg.Name == Name)
+        return &Arg;
+    return nullptr;
   }
 
+  RecordVal *getTemplateArg(const Init *Name) {
+    return const_cast<RecordVal *>(
+        static_cast<const Record *>(this)->getTemplateArg(Name));
+  }
+
+  /// Return the field with the given name, or null if there is none. Use
+  /// getTemplateArg() to look up template arguments.
   const RecordVal *getValue(const Init *Name) const {
     for (const RecordVal &Val : Values)
       if (Val.Name == Name) return &Val;
@@ -1869,12 +1885,18 @@ public:
         static_cast<const Record *>(this)->getValue(Name));
   }
 
-  void addTemplateArg(const Init *Name) {
-    assert(!isTemplateArg(Name) && "Template arg already defined!");
-    TemplateArgs.push_back(Name);
+  /// Add a template argument. Return false, without adding it, if there is
+  /// already a template argument with the same name.
+  bool addTemplateArg(const RecordVal &Arg) {
+    assert(Arg.isTemplateArg() && "Not a template argument!");
+    if (getTemplateArg(Arg.getNameInit()))
+      return false;
+    TemplateArgs.push_back(Arg);
+    return true;
   }
 
   void addValue(const RecordVal &RV) {
+    assert(!RV.isTemplateArg() && "Use addTemplateArg for template arguments");
     assert(getValue(RV.getNameInit()) == nullptr && "Value already added!");
     Values.push_back(RV);
   }
@@ -2043,7 +2065,7 @@ public:
 raw_ostream &operator<<(raw_ostream &OS, const Record &R);
 
 class RecordKeeper {
-  using RecordMap = std::map<std::string, std::unique_ptr<Record>, std::less<>>;
+  using RecordMap = StringMap<std::unique_ptr<Record>>;
   using GlobalMap = std::map<std::string, const Init *, std::less<>>;
 
 public:
@@ -2056,25 +2078,25 @@ public:
   /// Get the main TableGen input file's name.
   StringRef getInputFilename() const { return InputFilename; }
 
-  /// Get the map of classes.
-  const RecordMap &getClasses() const { return Classes; }
+  /// Get all classes, sorted by name.
+  ArrayRef<const Record *> getClasses() const;
 
-  /// Get the map of records (defs).
-  const RecordMap &getDefs() const { return Defs; }
+  /// Get all records (defs), sorted by name.
+  ArrayRef<const Record *> getDefs() const;
 
   /// Get the map of global variables.
   const GlobalMap &getGlobals() const { return ExtraGlobals; }
 
   /// Get the class with the specified name.
   const Record *getClass(StringRef Name) const {
-    auto I = Classes.find(Name);
-    return I == Classes.end() ? nullptr : I->second.get();
+    auto It = Classes.find(Name);
+    return It == Classes.end() ? nullptr : It->second.get();
   }
 
   /// Get the concrete record with the specified name.
   const Record *getDef(StringRef Name) const {
-    auto I = Defs.find(Name);
-    return I == Defs.end() ? nullptr : I->second.get();
+    auto It = Defs.find(Name);
+    return It == Defs.end() ? nullptr : It->second.get();
   }
 
   /// Get the \p Init value of the specified global variable.
@@ -2090,14 +2112,15 @@ public:
   }
 
   void addClass(std::unique_ptr<Record> R) {
-    bool Ins =
-        Classes.try_emplace(std::string(R->getName()), std::move(R)).second;
+    bool Ins = Classes.try_emplace(R->getName(), std::move(R)).second;
     (void)Ins;
     assert(Ins && "Class already exists");
   }
 
   void addDef(std::unique_ptr<Record> R) {
-    bool Ins = Defs.try_emplace(std::string(R->getName()), std::move(R)).second;
+    for (const Record *SC : make_first_range(R->getDirectSuperClasses()))
+      DefsByDirectSuperClass[SC].push_back(R.get());
+    bool Ins = Defs.try_emplace(R->getName(), std::move(R)).second;
     (void)Ins;
     assert(Ins && "Record already exists");
     // Clear cache
@@ -2145,7 +2168,12 @@ private:
 
   std::string InputFilename;
   RecordMap Classes, Defs;
+  // Classes and Defs sorted by name, built on demand.
+  mutable std::vector<const Record *> SortedClasses, SortedDefs;
   mutable std::map<std::string, std::vector<const Record *>> Cache;
+  // The defs that each class is a direct superclass of.
+  DenseMap<const Record *, SmallVector<const Record *, 0>>
+      DefsByDirectSuperClass;
   GlobalMap ExtraGlobals;
 
   /// The internal uniquer implementation of the RecordKeeper.

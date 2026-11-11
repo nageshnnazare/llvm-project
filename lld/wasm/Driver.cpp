@@ -1321,7 +1321,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   for (auto *arg : args.filtered(OPT_mllvm))
     v.push_back(arg->getValue());
   cl::ResetAllOptionOccurrences();
-  cl::ParseCommandLineOptions(v.size(), v.data());
+  cl::parseCommandLineOptions(ctx.arg.libraryOptions, v);
 
   readConfigs(args);
   setConfigs();
@@ -1468,6 +1468,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   // Resolve any variant symbols that were created due to signature
   // mismatches.
   symtab->handleSymbolVariants();
+  symtab->checkImportAttributes();
   if (errorCount())
     return;
 
