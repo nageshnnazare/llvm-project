@@ -189,6 +189,88 @@ define i32 @weighted_selects(i32 %a, i32 %b) !prof !19 {
   ret i32 %sel1
 }
 
+declare i32 @h()
+
+; Zero-extended select with byte insertion (issue #242379).
+define i64 @test_zext_byte_insert(i32 %c, ptr %p, ptr %g) {
+; CHECK-LABEL: test_zext_byte_insert:
+; CHECK:       # %bb.0:
+; CHECK-NEXT:    pushq %rbp
+; CHECK-NEXT:    .cfi_def_cfa_offset 16
+; CHECK-NEXT:    pushq %r14
+; CHECK-NEXT:    .cfi_def_cfa_offset 24
+; CHECK-NEXT:    pushq %rbx
+; CHECK-NEXT:    .cfi_def_cfa_offset 32
+; CHECK-NEXT:    .cfi_offset %rbx, -32
+; CHECK-NEXT:    .cfi_offset %r14, -24
+; CHECK-NEXT:    .cfi_offset %rbp, -16
+; CHECK-NEXT:    movq %rdx, %rbx
+; CHECK-NEXT:    movq %rsi, %r14
+; CHECK-NEXT:    movl %edi, %ebp
+; CHECK-NEXT:    callq h@PLT
+; CHECK-NEXT:    # kill: def $eax killed $eax def $rax
+; CHECK-NEXT:    testl %ebp, %ebp
+; CHECK-NEXT:    cmovnel (%r14), %eax
+; CHECK-NEXT:    movb (%rbx), %al
+; CHECK-NEXT:    popq %rbx
+; CHECK-NEXT:    .cfi_def_cfa_offset 24
+; CHECK-NEXT:    popq %r14
+; CHECK-NEXT:    .cfi_def_cfa_offset 16
+; CHECK-NEXT:    popq %rbp
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    retq
+  %x = call i32 @h()
+  %y = load i32, ptr %p
+  %cond = icmp eq i32 %c, 0
+  %s = select i1 %cond, i32 %x, i32 %y
+  %l = load i8, ptr %g
+  %z = zext i8 %l to i32
+  %a = and i32 %s, -256
+  %o = or i32 %a, %z
+  %r = zext i32 %o to i64
+  ret i64 %r
+}
+
+; Zero-extended select with 16-bit word insertion (issue #242379).
+define i64 @test_zext_word_insert(i32 %c, ptr %p, ptr %g) {
+; CHECK-LABEL: test_zext_word_insert:
+; CHECK:       # %bb.0:
+; CHECK-NEXT:    pushq %rbp
+; CHECK-NEXT:    .cfi_def_cfa_offset 16
+; CHECK-NEXT:    pushq %r14
+; CHECK-NEXT:    .cfi_def_cfa_offset 24
+; CHECK-NEXT:    pushq %rbx
+; CHECK-NEXT:    .cfi_def_cfa_offset 32
+; CHECK-NEXT:    .cfi_offset %rbx, -32
+; CHECK-NEXT:    .cfi_offset %r14, -24
+; CHECK-NEXT:    .cfi_offset %rbp, -16
+; CHECK-NEXT:    movq %rdx, %rbx
+; CHECK-NEXT:    movq %rsi, %r14
+; CHECK-NEXT:    movl %edi, %ebp
+; CHECK-NEXT:    callq h@PLT
+; CHECK-NEXT:    # kill: def $eax killed $eax def $rax
+; CHECK-NEXT:    testl %ebp, %ebp
+; CHECK-NEXT:    cmovnel (%r14), %eax
+; CHECK-NEXT:    movw (%rbx), %ax
+; CHECK-NEXT:    popq %rbx
+; CHECK-NEXT:    .cfi_def_cfa_offset 24
+; CHECK-NEXT:    popq %r14
+; CHECK-NEXT:    .cfi_def_cfa_offset 16
+; CHECK-NEXT:    popq %rbp
+; CHECK-NEXT:    .cfi_def_cfa_offset 8
+; CHECK-NEXT:    retq
+  %x = call i32 @h()
+  %y = load i32, ptr %p
+  %cond = icmp eq i32 %c, 0
+  %s = select i1 %cond, i32 %x, i32 %y
+  %l = load i16, ptr %g
+  %z = zext i16 %l to i32
+  %a = and i32 %s, -65536
+  %o = or i32 %a, %z
+  %r = zext i32 %o to i64
+  ret i64 %r
+}
+
 !llvm.module.flags = !{!0}
 !0 = !{i32 1, !"ProfileSummary", !1}
 !1 = !{!2, !3, !4, !5, !6, !7, !8, !9}

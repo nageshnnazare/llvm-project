@@ -45,6 +45,7 @@
 #include "X86Subtarget.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -253,6 +254,60 @@ bool X86CmovConversionImpl::runOnMachineFunction(MachineFunction &MF) {
   return Changed;
 }
 
+/// Check if any user of \p Reg (or registers derived from it via COPY,
+/// INSERT_SUBREG, or PHI) relies on the zero-extending behavior of a 32-bit
+/// operation.
+static bool checkZeroExtendingSubregUse(Register Reg,
+                                        const MachineRegisterInfo *MRI) {
+  if (!Reg.isVirtual())
+    return false;
+
+  SmallVector<Register, 8> Worklist;
+  DenseSet<Register> Visited;
+
+  Worklist.push_back(Reg);
+  Visited.insert(Reg);
+
+  while (!Worklist.empty()) {
+    Register CurrReg = Worklist.pop_back_val();
+    for (MachineInstr &UseI : MRI->use_nodbg_instructions(CurrReg)) {
+      if (UseI.getOpcode() == TargetOpcode::SUBREG_TO_REG)
+        return true;
+
+      if (UseI.isCopy()) {
+        if (UseI.getOperand(0).getSubReg() == 0 &&
+            UseI.getOperand(1).getSubReg() == 0) {
+          Register DstReg = UseI.getOperand(0).getReg();
+          if (DstReg.isVirtual() && Visited.insert(DstReg).second)
+            Worklist.push_back(DstReg);
+        }
+        continue;
+      }
+
+      if (UseI.getOpcode() == TargetOpcode::INSERT_SUBREG) {
+        // Only follow when CurrReg is the super-register being inserted into.
+        if (UseI.getOperand(1).isReg() &&
+            UseI.getOperand(1).getReg() == CurrReg &&
+            UseI.getOperand(1).getSubReg() == 0) {
+          Register DstReg = UseI.getOperand(0).getReg();
+          if (DstReg.isVirtual() && Visited.insert(DstReg).second)
+            Worklist.push_back(DstReg);
+        }
+        continue;
+      }
+
+      if (UseI.isPHI()) {
+        Register DstReg = UseI.getOperand(0).getReg();
+        if (DstReg.isVirtual() && Visited.insert(DstReg).second)
+          Worklist.push_back(DstReg);
+        continue;
+      }
+    }
+  }
+
+  return false;
+}
+
 bool X86CmovConversionImpl::collectCmovCandidates(
     ArrayRef<MachineBasicBlock *> Blocks, CmovGroups &CmovInstGroups,
     bool IncludeLoads) {
@@ -324,11 +379,7 @@ bool X86CmovConversionImpl::collectCmovCandidates(
         }
         // Check if we were relying on zero-extending behavior of the CMOV.
         if (!SkipGroup &&
-            llvm::any_of(
-                MRI->use_nodbg_instructions(I.defs().begin()->getReg()),
-                [&](MachineInstr &UseI) {
-                  return UseI.getOpcode() == X86::SUBREG_TO_REG;
-                }))
+            checkZeroExtendingSubregUse(I.defs().begin()->getReg(), MRI))
           // FIXME: We should model the cost of using an explicit MOV to handle
           // the zero-extension rather than just refusing to handle this.
           SkipGroup = true;
